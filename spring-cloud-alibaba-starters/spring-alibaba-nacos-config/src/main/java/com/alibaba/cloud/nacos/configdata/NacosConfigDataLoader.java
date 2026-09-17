@@ -74,41 +74,58 @@ public class NacosConfigDataLoader implements ConfigDataLoader<NacosConfigDataRe
 
 	public @Nullable ConfigData doLoad(ConfigDataLoaderContext context,
 			NacosConfigDataResource resource) {
+		NacosConfigManager configManager = getBean(context, NacosConfigManager.class);
+		if (configManager == null) {
+			throw new IllegalStateException("NacosConfigManager not available");
+		}
+		ConfigService configService = configManager.getConfigService();
+		NacosConfigProperties properties = getBean(context,
+				NacosConfigProperties.class);
+		if (properties == null) {
+			throw new IllegalStateException("NacosConfigProperties not available");
+		}
+
+		NacosItemConfig config = resource.getConfig();
+
+		// Fetch the raw content from nacos. A failure here means the config is genuinely
+		// unavailable, so it keeps honoring the `optional:` semantics.
+		String configContent;
 		try {
-			NacosConfigManager configManager = getBean(context, NacosConfigManager.class);
-			if (configManager == null) {
-				throw new IllegalStateException("NacosConfigManager not available");
-			}
-			ConfigService configService = configManager.getConfigService();
-			NacosConfigProperties properties = getBean(context,
-					NacosConfigProperties.class);
-			if (properties == null) {
-				throw new IllegalStateException("NacosConfigProperties not available");
-			}
-
-			NacosItemConfig config = resource.getConfig();
-			// pull config from nacos
-			List<PropertySource<?>> propertySources = pullConfig(configService,
-					config.getGroup(), config.getDataId(), config.getSuffix(),
-					properties.getTimeout(), properties.getNamespace());
-
-			NacosPropertySource propertySource = new NacosPropertySource(propertySources,
-					config.getGroup(), config.getDataId(), new Date(),
-					config.isRefreshEnabled());
-			propertySource.setSuffix(config.getSuffix());
-
-			NacosPropertySourceRepository.collectNacosPropertySource(propertySource);
-
-			return new ConfigData(Collections.singletonList(propertySource),
-					getOptions(context, resource));
+			configContent = fetchConfig(configService, config.getGroup(),
+					config.getDataId(), properties.getTimeout(),
+					properties.getNamespace());
 		}
 		catch (Exception e) {
 			log.error("Error getting properties from nacos: " + resource, e);
 			if (!resource.isOptional()) {
 				throw new ConfigDataResourceNotFoundException(resource, e);
 			}
+			return null;
 		}
-		return null;
+
+		// Parse the fetched content. A failure here means the config exists but its
+		// content is broken, so surface the real cause instead of reporting the resource
+		// as "not found", which would mislead users into adding `optional:` and silently
+		// skipping a genuinely broken config.
+		List<PropertySource<?>> propertySources;
+		try {
+			propertySources = parseConfig(config.getGroup(), config.getDataId(),
+					config.getSuffix(), configContent);
+		}
+		catch (Exception e) {
+			log.error("Error parsing config from nacos: " + resource, e);
+			throw new NacosConfigParseException(config.getDataId(), config.getGroup(), e);
+		}
+
+		NacosPropertySource propertySource = new NacosPropertySource(propertySources,
+				config.getGroup(), config.getDataId(), new Date(),
+				config.isRefreshEnabled());
+		propertySource.setSuffix(config.getSuffix());
+
+		NacosPropertySourceRepository.collectNacosPropertySource(propertySource);
+
+		return new ConfigData(Collections.singletonList(propertySource),
+				getOptions(context, resource));
 	}
 
 	private Option[] getOptions(ConfigDataLoaderContext context,
@@ -152,9 +169,8 @@ public class NacosConfigDataLoader implements ConfigDataLoader<NacosConfigDataRe
 		return preference;
 	}
 
-	private List<PropertySource<?>> pullConfig(ConfigService configService, String group,
-			String dataId, String suffix, long timeout, @Nullable String namespace)
-			throws NacosException, IOException {
+	private String fetchConfig(ConfigService configService, String group, String dataId,
+			long timeout, @Nullable String namespace) throws NacosException {
 		String config = NacosSnapshotConfigManager.getAndRemoveConfigSnapshot(namespace,
 				dataId, group);
 		if (config == null) {
@@ -166,9 +182,15 @@ public class NacosConfigDataLoader implements ConfigDataLoader<NacosConfigDataRe
 					dataId, group));
 		}
 		logLoadInfo(group, dataId, config);
+		return config;
+	}
+
+	private List<PropertySource<?>> parseConfig(String group, String dataId,
+			String suffix, String configContent) throws IOException {
 		// fixed issue: https://github.com/alibaba/spring-cloud-alibaba/issues/2906 .
 		String configName = group + "@" + dataId;
-		return NacosDataParserHandler.getInstance().parseNacosData(configName, config, suffix);
+		return NacosDataParserHandler.getInstance()
+				.parseNacosData(configName, configContent, suffix);
 	}
 
 	private void logLoadInfo(String group, String dataId, String config) {
